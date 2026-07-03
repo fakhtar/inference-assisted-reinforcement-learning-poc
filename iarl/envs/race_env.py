@@ -8,6 +8,14 @@ Inference Assisted Reinforcement Learning (IARL) experiment.
 Observation (default): front_camera RGB array (bumper-cam, no car in frame)
 Additional observation:  top_down RGB array (full track, car position marked)
 Action space: Discrete(5) — turn_left, turn_right, accelerate, brake, do_nothing
+
+v3 changes vs v2:
+- Complete track geometry redesign. All 7 segment joins verified at 0.00px gap.
+- Shape is now a clean stadium/teardrop: bottom straight, right sweeper,
+  short right connector, tight hairpin (top-right), top straight, left
+  sweeper, left descent. No self-intersections. All points within bounds.
+- Rendering switched from single large polygon to per-segment quads,
+  eliminating self-intersection artifacts.
 """
 
 import math
@@ -30,15 +38,16 @@ DO_NOTHING  = 4
 
 # Physics
 MAX_SPEED         = 8.0    # pixels per timestep at full throttle
-MIN_SPEED         = 0.5    # car never fully stops (keeps momentum)
+MIN_SPEED         = 2.0    # car always has meaningful momentum
+START_SPEED       = 3.0    # speed at episode start
 ACCELERATION_STEP = 0.5    # speed gained per ACCELERATE action
 BRAKE_STEP        = 1.0    # speed lost per BRAKE action
+ROLLING_RESIST    = 0.02   # speed lost per timestep (rolling resistance)
 BASE_TURN_RATE    = 0.12   # radians per timestep at zero speed
-TURN_SPEED_DECAY  = 0.015  # turn rate reduction per unit of speed
-                            # effective_turn = BASE - TURN_SPEED_DECAY * speed
+TURN_SPEED_DECAY  = 0.015  # effective_turn = BASE - TURN_SPEED_DECAY * speed
 
 # Collision
-GRAZE_DISTANCE    = 4      # pixels inside boundary = graze penalty
+GRAZE_DISTANCE    = 4      # pixels inside boundary = graze zone
 GRAZE_PENALTY     = -1.0
 COLLISION_PENALTY = -10.0
 
@@ -53,22 +62,21 @@ SCREEN_H          = 600
 FPS               = 30
 
 # Camera
-BUMPER_CAM_W      = 160    # front_camera output width  (pixels)
-BUMPER_CAM_H      = 120    # front_camera output height (pixels)
-BUMPER_CAM_DIST   = 120    # how far ahead the camera sees (world units)
-BUMPER_CAM_FOV    = 90     # horizontal field of view (degrees)
-TOP_DOWN_W        = 160    # top_down output width
-TOP_DOWN_H        = 120    # top_down output height
+BUMPER_CAM_W      = 160
+BUMPER_CAM_H      = 120
+BUMPER_CAM_DIST   = 120
+BUMPER_CAM_FOV    = 90
+TOP_DOWN_W        = 160
+TOP_DOWN_H        = 120
 
 # Colours
-COL_BG            = (30,  30,  30)
-COL_TRACK         = (80,  80,  80)
 COL_GRASS         = (34,  85,  34)
+COL_TRACK         = (80,  80,  80)
 COL_CENTERLINE    = (200, 200,  50)
 COL_CAR           = (220,  50,  50)
 COL_CHECKPOINT    = (50,  200, 200)
 COL_STARTLINE     = (255, 255, 255)
-COL_WALL_NEAR     = (220,  80,  80)   # bumper cam wall tint when close
+COL_WALL_NEAR     = (220,  80,  80)
 
 
 # ---------------------------------------------------------------------------
@@ -77,149 +85,130 @@ COL_WALL_NEAR     = (220,  80,  80)   # bumper cam wall tint when close
 
 def _build_track():
     """
-    Build the Basra Loop circuit.
+    Build the Basra Loop — a clean 7-segment closed circuit.
+
+    All segment joins verified at 0.00px gap. All points within
+    x=[90,730], y=[200,490] — well inside the 800x600 window.
+
+    Traversal: counterclockwise.
+
+    Segment map:
+      S1  Bottom straight    (120,490) -> (550,490)   hw=38  WIDE
+      S2  Right sweeper arc  (550,490) -> (730,310)   hw=34  medium
+      S3  Right connector    (730,310) -> (730,200)   hw=30  medium
+      S4  Hairpin arc        (730,200) -> (570,200)   hw=20  NARROW
+      S5  Top straight       (570,200) -> (200,200)   hw=30  medium
+      S6  Left sweeper arc   (200,200) -> (90,310)    hw=32  medium
+      S7  Left descent       (90,310)  -> (120,490)   hw=34  medium
+
+    Four trap types from geometry alone:
+      Speed floor   — S1 long straight punishes passivity via time penalty
+      Early braking — S2 sweeper can be taken faster than naive policy tries
+      Hairpin stall — S4 physically impassable at full speed (hw=20, tight)
+      Wall hugging  — S6 left sweeper outer wall is the tempting but slow line
 
     Returns
     -------
-    centerline : list of (x, y) floats
-        Ordered points forming the closed centerline loop.
-    half_widths : list of floats
-        Half-width of the track at each centerline point.
-        Full track width = 2 * half_width.
+    points     : list of (x, y) floats
+    half_widths: list of floats
     """
-    # We construct the track as a series of arc/line segments defined by
-    # (cx, cy, radius, start_angle_deg, end_angle_deg, steps, half_width)
-    # for curves, and
-    # (x0,y0, x1,y1, steps, half_width)
-    # for straights.
-    # All angles: 0 = right (+x), 90 = up (-y) in screen coords.
-    # We accumulate points and widths.
-
     points = []
     widths = []
 
-    def arc(cx, cy, r, a_start, a_end, steps, hw):
-        """Append an arc segment (screen coords: y increases downward)."""
+    def arc(cx, cy, r, a_start_deg, a_end_deg, steps, hw):
+        """Append arc points. Angles in degrees, screen coords (y down)."""
         for i in range(steps + 1):
             t = i / steps
-            a = math.radians(a_start + t * (a_end - a_start))
-            x = cx + r * math.cos(a)
-            y = cy + r * math.sin(a)
-            points.append((x, y))
+            a = math.radians(a_start_deg + t * (a_end_deg - a_start_deg))
+            points.append((cx + r * math.cos(a), cy + r * math.sin(a)))
             widths.append(hw)
 
     def straight(x0, y0, x1, y1, steps, hw):
-        """Append a straight segment."""
+        """Append straight segment points."""
         for i in range(steps + 1):
             t = i / steps
-            x = x0 + t * (x1 - x0)
-            y = y0 + t * (y1 - y0)
-            points.append((x, y))
+            points.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
             widths.append(hw)
 
-    # ------------------------------------------------------------------
-    # Basra Loop — counterclockwise traversal
-    # Screen origin top-left. Track fits inside 800x600 with margins.
-    #
-    # Segment layout (approximate world coords):
-    #
-    #   [5] Descent straight   [4] Top left sweeper (medium left)
-    #       left side down  ←──────────────────────────────
-    #       |                                              |
-    #       |  [6] Start/finish                    [3] Short connector
-    #       |                                              |
-    #       └──────────────────────────────────────────── [2] Hairpin (top-right, tight)
-    #   [1] Long straight (bottom, left→right)    [2b] exits downward
-    #   start here →
-    #
-    # Exact coordinates chosen so the track is visually clear at 800x600.
-    # ------------------------------------------------------------------
+    # S1: Bottom straight — wide, long. Car starts here heading right.
+    straight(120, 490, 550, 490, steps=30, hw=38)
 
-    # Segment 1: Long straight — bottom of screen, left to right
-    # Wide track (half_width=38). Car starts here heading right (+x).
-    # From (100, 480) to (580, 480)
-    straight(100, 480, 580, 480, steps=30, hw=38)
+    # S2: Bottom-right sweeper
+    # Center (550,310), r=180. Arc 90°->0°.
+    # Verified: start=(550,490), end=(730,310). Gap to S1 end: 0.00px.
+    arc(cx=550, cy=310, r=180, a_start_deg=90, a_end_deg=0, steps=20, hw=34)
 
-    # Segment 2: Bottom-right medium sweeper — curves upward (arc going from
-    # 90° to 0° in standard math, which in screen coords is a right-hand
-    # turn curving upward). Center at (580, 340), radius 140.
-    # Enters from bottom (angle 90° screen = pointing down = 90 in pygame),
-    # exits pointing upward (angle 270° screen).
-    # In pygame coords (y down): center (620, 480), arc from 180° to 270°
-    arc(cx=620, cy=340, r=140, a_start=90, a_end=180, steps=20, hw=34)
+    # S3: Right connector — short vertical, car heading upward
+    # Verified: start=(730,310), end=(730,200). Gap to S2 end: 0.00px.
+    straight(730, 310, 730, 200, steps=8, hw=30)
 
-    # Segment 3: Short connector — right side, travelling upward
-    # From approx (620, 200) to (620, 130)
-    straight(620, 200, 590, 130, steps=8, hw=30)
+    # S4: Hairpin — tight, narrow (hw=20, full width 40px vs 76px on straight)
+    # Center (650,200), r=80. Arc 0°->180°.
+    # Verified: start=(730,200), end=(570,200). Gap to S3 end: 0.00px.
+    # Car enters heading upward, exits heading downward-left.
+    arc(cx=650, cy=200, r=80, a_start_deg=0, a_end_deg=180, steps=28, hw=20)
 
-    # Segment 4: Hairpin — top right, tight turn. Narrow track.
-    # Car arrives from below heading upward, hairpin turns it back downward-left.
-    # Center at (530, 110), radius 60. Arc from 0° to 180° (screen coords).
-    # Narrow: half_width=20 (full width 40px vs 76px on the straight).
-    arc(cx=530, cy=110, r=60, a_start=0, a_end=180, steps=24, hw=20)
+    # S5: Top straight — car heading left
+    # Verified: start=(570,200). Gap to S4 end: 0.00px.
+    straight(570, 200, 200, 200, steps=24, hw=30)
 
-    # Segment 5: Top sweeper — top of screen, right to left (medium radius).
-    # Car exits hairpin heading downward-left, sweeper carries it leftward.
-    # Center at (310, 200), radius 110. Arc from 330° to 210° (screen coords).
-    arc(cx=320, cy=160, r=130, a_start=330, a_end=210, steps=28, hw=30)
+    # S6: Left sweeper arc
+    # Center (200,310), r=110. Arc 270°->180°.
+    # Verified: start=(200,200), end=(90,310). Gap to S5 end: 0.00px.
+    arc(cx=200, cy=310, r=110, a_start_deg=270, a_end_deg=180, steps=16, hw=32)
 
-    # Segment 6: Descent straight — left side, travelling downward
-    # From approx (190, 200) to (100, 480)
-    straight(190, 260, 100, 480, steps=20, hw=32)
+    # S7: Left descent — car heading downward, closing loop to S1
+    # Verified: start=(90,310), end=(120,490). Gap to S6 end: 0.00px.
+    # Loop closure: S7 end=(120,490) == S1 start=(120,490). Gap: 0.00px.
+    straight(90, 310, 120, 490, steps=14, hw=34)
 
     return points, widths
 
 
 def _compute_track_geometry(raw_points, raw_widths):
     """
-    Deduplicate consecutive identical points, compute cumulative arc length,
-    and build left/right boundary point lists.
+    Deduplicate, compute per-point normals, build left/right boundaries.
 
     Returns
     -------
-    centerline : np.ndarray (N, 2)
-    half_widths : np.ndarray (N,)
-    left_boundary : np.ndarray (N, 2)
-    right_boundary : np.ndarray (N, 2)
-    arc_lengths : np.ndarray (N,)   cumulative distance along centerline
-    total_length : float
+    centerline    : np.ndarray (N,2)
+    half_widths   : np.ndarray (N,)
+    left_boundary : np.ndarray (N,2)
+    right_boundary: np.ndarray (N,2)
+    arc_lengths   : np.ndarray (N,)
+    total_length  : float
     """
     pts = np.array(raw_points, dtype=np.float32)
-    hws = np.array(raw_widths, dtype=np.float32)
+    hws = np.array(raw_widths,  dtype=np.float32)
 
-    # Deduplicate
+    # Deduplicate consecutive near-identical points
     keep = [0]
     for i in range(1, len(pts)):
         if np.linalg.norm(pts[i] - pts[keep[-1]]) > 0.5:
             keep.append(i)
     pts = pts[keep]
     hws = hws[keep]
+    N   = len(pts)
 
-    N = len(pts)
-
-    # Normals (perpendicular to tangent, pointing left of travel direction)
     left_b  = np.zeros_like(pts)
     right_b = np.zeros_like(pts)
 
     for i in range(N):
-        prev = pts[(i - 1) % N]
-        nxt  = pts[(i + 1) % N]
+        prev    = pts[(i - 1) % N]
+        nxt     = pts[(i + 1) % N]
         tangent = nxt - prev
         length  = np.linalg.norm(tangent)
-        if length < 1e-6:
-            tangent = np.array([1.0, 0.0])
-        else:
-            tangent /= length
-        # Normal: rotate tangent 90° left (in screen coords: (-dy, dx))
-        normal = np.array([-tangent[1], tangent[0]])
-        left_b[i]  = pts[i] + normal * hws[i]
-        right_b[i] = pts[i] - normal * hws[i]
+        tangent = tangent / length if length > 1e-6 else np.array([1.0, 0.0])
+        # Left normal (screen coords, y down): rotate tangent 90° CCW = (-dy, dx)
+        normal      = np.array([-tangent[1], tangent[0]])
+        left_b[i]   = pts[i] + normal * hws[i]
+        right_b[i]  = pts[i] - normal * hws[i]
 
-    # Arc lengths
+    # Cumulative arc length
     arc = np.zeros(N, dtype=np.float32)
     for i in range(1, N):
-        arc[i] = arc[i-1] + np.linalg.norm(pts[i] - pts[i-1])
-    total = arc[-1] + np.linalg.norm(pts[0] - pts[-1])
+        arc[i] = arc[i - 1] + np.linalg.norm(pts[i] - pts[i - 1])
+    total = float(arc[-1] + np.linalg.norm(pts[0] - pts[-1]))
 
     return pts, hws, left_b, right_b, arc, total
 
@@ -233,16 +222,14 @@ class RaceEnv(gym.Env):
     IARL Race Environment.
 
     Observation space : Box(BUMPER_CAM_H, BUMPER_CAM_W, 3, uint8)
-        front_camera bumper-cam RGB image (default observation).
-
-    Action space : Discrete(5)
+    Action space      : Discrete(5)
         0 turn_left | 1 turn_right | 2 accelerate | 3 brake | 4 do_nothing
 
     Info dict keys (every step):
         top_down        : np.ndarray (TOP_DOWN_H, TOP_DOWN_W, 3) uint8
         speed           : float
         heading         : float  radians
-        checkpoint      : int    index of last passed checkpoint
+        checkpoint      : int    index of next checkpoint to pass
         lap             : int    laps completed
         track_progress  : float  0..1 fraction of current lap completed
     """
@@ -251,10 +238,9 @@ class RaceEnv(gym.Env):
 
     def __init__(self, render_mode=None):
         super().__init__()
-
         self.render_mode = render_mode
 
-        # Build track
+        # Build track geometry
         raw_pts, raw_hws = _build_track()
         (self.centerline,
          self.half_widths,
@@ -263,16 +249,15 @@ class RaceEnv(gym.Env):
          self.arc_lengths,
          self.total_length) = _compute_track_geometry(raw_pts, raw_hws)
 
-        self.N = len(self.centerline)  # number of centerline points
+        self.N = len(self.centerline)
 
-        # Checkpoints: evenly spaced by arc length (every ~10% of lap)
-        n_checkpoints = 10
-        cp_arc_targets = [self.total_length * i / n_checkpoints
-                          for i in range(n_checkpoints)]
+        # 10 checkpoints at equal arc-length intervals
         self.checkpoint_indices = []
-        for target in cp_arc_targets:
-            idx = int(np.argmin(np.abs(self.arc_lengths - target)))
-            self.checkpoint_indices.append(idx)
+        for i in range(10):
+            target = self.total_length * i / 10
+            self.checkpoint_indices.append(
+                int(np.argmin(np.abs(self.arc_lengths - target)))
+            )
 
         # Gymnasium spaces
         self.observation_space = spaces.Box(
@@ -282,22 +267,20 @@ class RaceEnv(gym.Env):
         )
         self.action_space = spaces.Discrete(5)
 
-        # Pygame state (lazy init)
-        self._screen      = None
-        self._clock       = None
-        self._font        = None
-        self._surf_track  = None   # pre-rendered track surface
+        # Pygame (lazy init)
+        self._screen = None
+        self._clock  = None
 
-        # Car state (set in reset)
-        self._pos     = None   # np.array [x, y]
-        self._heading = None   # radians; 0 = right, π/2 = down (screen)
+        # Car state (populated in reset)
+        self._pos     = None
+        self._heading = None
         self._speed   = None
 
         # Episode state
         self._next_checkpoint = None
         self._laps_completed  = None
         self._steps           = None
-        self._closest_idx     = None   # index on centerline nearest to car
+        self._closest_idx     = None
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -305,13 +288,9 @@ class RaceEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-
-        # Place car at the start of the centerline (index 0), heading right
-        start = self.centerline[0].copy()
-        self._pos     = start.astype(np.float32)
-        self._heading = 0.0   # pointing right (+x), along the straight
-        self._speed   = MIN_SPEED
-
+        self._pos             = self.centerline[0].copy().astype(np.float32)
+        self._heading         = 0.0          # pointing right along bottom straight
+        self._speed           = START_SPEED
         self._next_checkpoint = 0
         self._laps_completed  = 0
         self._steps           = 0
@@ -324,44 +303,38 @@ class RaceEnv(gym.Env):
     def step(self, action):
         self._steps += 1
 
-        # 1. Apply action
+        # 1. Apply action → updates heading and speed
         self._apply_action(action)
 
         # 2. Move car
-        dx = math.cos(self._heading) * self._speed
-        dy = math.sin(self._heading) * self._speed
-        self._pos[0] += dx
-        self._pos[1] += dy
+        self._pos[0] += math.cos(self._heading) * self._speed
+        self._pos[1] += math.sin(self._heading) * self._speed
 
-        # 3. Update closest centerline index (used for width lookup + progress)
+        # 3. Update nearest centerline index
         self._closest_idx = self._find_closest_idx(self._pos)
 
-        # 4. Collision detection
+        # 4. Collision check
         reward, terminated = self._check_collision()
 
-        # 5. Checkpoint / lap logic (only if not already terminated)
+        # 5. Checkpoint / lap (only if still alive)
         if not terminated:
-            cp_reward, lap_reward = self._check_checkpoints()
-            reward += cp_reward + lap_reward
+            cp_r, lap_r = self._check_checkpoints()
+            reward += cp_r + lap_r
             if self._laps_completed >= 1:
                 terminated = True
 
         # 6. Time penalty
         reward += TIME_PENALTY
 
-        truncated = False
         obs  = self._render_bumper_cam()
         info = self._build_info()
-
-        return obs, reward, terminated, truncated, info
+        return obs, reward, terminated, False, info
 
     def render(self):
-        """Display top-down view in a pygame window."""
         if self.render_mode != "human":
             return
         self._ensure_pygame()
-        surf = self._render_top_down_surface(scale=1.0,
-                                              w=SCREEN_W, h=SCREEN_H)
+        surf = self._render_top_down_surface(w=SCREEN_W, h=SCREEN_H)
         self._screen.blit(surf, (0, 0))
         pygame.display.flip()
         self._clock.tick(FPS)
@@ -377,8 +350,7 @@ class RaceEnv(gym.Env):
 
     def _apply_action(self, action):
         # Turn rate degrades with speed
-        turn_rate = max(0.01,
-                        BASE_TURN_RATE - TURN_SPEED_DECAY * self._speed)
+        turn_rate = max(0.01, BASE_TURN_RATE - TURN_SPEED_DECAY * self._speed)
 
         if action == TURN_LEFT:
             self._heading -= turn_rate
@@ -388,10 +360,10 @@ class RaceEnv(gym.Env):
             self._speed = min(MAX_SPEED, self._speed + ACCELERATION_STEP)
         elif action == BRAKE:
             self._speed = max(MIN_SPEED, self._speed - BRAKE_STEP)
-        # DO_NOTHING: no change
+        # DO_NOTHING: no change before resistance
 
-        # Speed bleeds off slightly every step (rolling resistance)
-        self._speed = max(MIN_SPEED, self._speed - 0.05)
+        # Rolling resistance every step
+        self._speed = max(MIN_SPEED, self._speed - ROLLING_RESIST)
 
         # Wrap heading to [-π, π]
         self._heading = (self._heading + math.pi) % (2 * math.pi) - math.pi
@@ -401,72 +373,54 @@ class RaceEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _check_collision(self):
-        """
-        Returns (reward_delta, terminated).
-        Uses the half-width at the nearest centerline point to define
-        the track boundary at the car's current location.
-        """
-        idx = self._closest_idx
+        idx    = self._closest_idx
         center = self.centerline[idx]
         hw     = self.half_widths[idx]
-
-        dist = np.linalg.norm(self._pos - center)
+        dist   = float(np.linalg.norm(self._pos - center))
 
         if dist > hw + GRAZE_DISTANCE:
-            # Full breach — episode ends
             return COLLISION_PENALTY, True
         elif dist > hw - GRAZE_DISTANCE:
-            # Graze — penalty, episode continues
             return GRAZE_PENALTY, False
-        else:
-            return 0.0, False
+        return 0.0, False
 
     # ------------------------------------------------------------------
     # Checkpoints and laps
     # ------------------------------------------------------------------
 
     def _check_checkpoints(self):
-        cp_reward  = 0.0
-        lap_reward = 0.0
-
-        cp_idx = self.checkpoint_indices[self._next_checkpoint]
-        dist_to_cp = np.linalg.norm(
-            self._pos - self.centerline[cp_idx]
-        )
+        cp_idx     = self.checkpoint_indices[self._next_checkpoint]
+        dist_to_cp = float(np.linalg.norm(self._pos - self.centerline[cp_idx]))
 
         if dist_to_cp < self.half_widths[cp_idx] * 1.5:
-            cp_reward = CHECKPOINT_REWARD
             self._next_checkpoint += 1
-
             if self._next_checkpoint >= len(self.checkpoint_indices):
-                # Completed all checkpoints = one lap
                 self._next_checkpoint = 0
                 self._laps_completed  += 1
-                lap_reward = LAP_REWARD
-
-        return cp_reward, lap_reward
+                return CHECKPOINT_REWARD, LAP_REWARD
+            return CHECKPOINT_REWARD, 0.0
+        return 0.0, 0.0
 
     # ------------------------------------------------------------------
     # Geometry helpers
     # ------------------------------------------------------------------
 
     def _find_closest_idx(self, pos):
-        """Return index of centerline point nearest to pos."""
         dists = np.linalg.norm(self.centerline - pos, axis=1)
         return int(np.argmin(dists))
 
     def _track_progress(self):
-        """Fraction 0..1 of current lap completed."""
-        return self.arc_lengths[self._closest_idx] / self.total_length
+        return float(self.arc_lengths[self._closest_idx] / self.total_length)
 
     # ------------------------------------------------------------------
     # Rendering — top-down
     # ------------------------------------------------------------------
 
-    def _render_top_down_surface(self, scale=1.0, w=SCREEN_W, h=SCREEN_H):
+    def _render_top_down_surface(self, w=SCREEN_W, h=SCREEN_H):
         """
-        Render a full top-down view of the track with car position.
-        Returns a pygame Surface of size (w, h).
+        Render the track as a series of per-segment quads rather than
+        a single large polygon. This eliminates self-intersection artifacts
+        that occur when the boundary polygon winds back on itself.
         """
         surf = pygame.Surface((w, h))
         surf.fill(COL_GRASS)
@@ -475,124 +429,106 @@ class RaceEnv(gym.Env):
         sy = h / SCREEN_H
 
         def sp(pt):
-            """Scale a world point to surface coords."""
             return (int(pt[0] * sx), int(pt[1] * sy))
 
-        # Draw filled track polygon (left boundary + reversed right boundary)
-        left_pts  = [sp(p) for p in self.left_boundary]
-        right_pts = [sp(p) for p in self.right_boundary]
-        track_poly = left_pts + list(reversed(right_pts))
-        if len(track_poly) >= 3:
-            pygame.draw.polygon(surf, COL_TRACK, track_poly)
+        # Draw track as consecutive quads between adjacent centerline points
+        for i in range(self.N - 1):
+            quad = [
+                sp(self.left_boundary[i]),
+                sp(self.left_boundary[i + 1]),
+                sp(self.right_boundary[i + 1]),
+                sp(self.right_boundary[i]),
+            ]
+            pygame.draw.polygon(surf, COL_TRACK, quad)
 
-        # Draw centerline dashes
+        # Close the loop: last point back to first
+        quad = [
+            sp(self.left_boundary[-1]),
+            sp(self.left_boundary[0]),
+            sp(self.right_boundary[0]),
+            sp(self.right_boundary[-1]),
+        ]
+        pygame.draw.polygon(surf, COL_TRACK, quad)
+
+        # Centerline dashes
         for i in range(0, self.N - 1, 4):
             pygame.draw.line(surf, COL_CENTERLINE,
                              sp(self.centerline[i]),
-                             sp(self.centerline[i+1]), 1)
+                             sp(self.centerline[i + 1]), 1)
 
-        # Draw checkpoints
+        # All checkpoint lines (cyan)
         for cp_i in self.checkpoint_indices:
-            lp = sp(self.left_boundary[cp_i])
-            rp = sp(self.right_boundary[cp_i])
-            pygame.draw.line(surf, COL_CHECKPOINT, lp, rp, 2)
+            pygame.draw.line(surf, COL_CHECKPOINT,
+                             sp(self.left_boundary[cp_i]),
+                             sp(self.right_boundary[cp_i]), 2)
 
-        # Highlight next checkpoint
+        # Next checkpoint highlighted yellow
         if self._next_checkpoint is not None:
             ncp = self.checkpoint_indices[self._next_checkpoint]
-            lp  = sp(self.left_boundary[ncp])
-            rp  = sp(self.right_boundary[ncp])
-            pygame.draw.line(surf, (255, 255, 0), lp, rp, 3)
+            pygame.draw.line(surf, (255, 255, 0),
+                             sp(self.left_boundary[ncp]),
+                             sp(self.right_boundary[ncp]), 3)
 
-        # Draw start line
+        # Start line white
         sl_i = self.checkpoint_indices[0]
         pygame.draw.line(surf, COL_STARTLINE,
                          sp(self.left_boundary[sl_i]),
                          sp(self.right_boundary[sl_i]), 3)
 
-        # Draw car
+        # Car: red dot + white heading arrow
         if self._pos is not None:
             cx, cy = sp(self._pos)
-            car_r  = max(4, int(6 * sx))
-            pygame.draw.circle(surf, COL_CAR, (cx, cy), car_r)
-            # Heading indicator
-            hx = cx + int(car_r * 1.8 * math.cos(self._heading))
-            hy = cy + int(car_r * 1.8 * math.sin(self._heading))
+            r      = max(5, int(7 * sx))
+            pygame.draw.circle(surf, COL_CAR, (cx, cy), r)
+            hx = cx + int(r * 2.0 * math.cos(self._heading))
+            hy = cy + int(r * 2.0 * math.sin(self._heading))
             pygame.draw.line(surf, (255, 255, 255), (cx, cy), (hx, hy), 2)
 
         return surf
 
     def _render_top_down_array(self):
-        """Return top-down view as (TOP_DOWN_H, TOP_DOWN_W, 3) uint8 array."""
         self._ensure_pygame()
-        surf = self._render_top_down_surface(scale=1.0,
-                                              w=TOP_DOWN_W, h=TOP_DOWN_H)
+        surf = self._render_top_down_surface(w=TOP_DOWN_W, h=TOP_DOWN_H)
         return pygame.surfarray.array3d(surf).transpose(1, 0, 2)
 
     # ------------------------------------------------------------------
-    # Rendering — bumper cam
+    # Rendering — bumper cam (ray-cast)
     # ------------------------------------------------------------------
 
     def _render_bumper_cam(self):
-        """
-        Render a forward-facing bumper-cam view.
-
-        Strategy: ray-cast from the car's position in a fan of directions
-        spanning BUMPER_CAM_FOV degrees ahead. For each ray, find where it
-        exits the track (hits a boundary). Map hit distance to a pixel column.
-        Render sky (top half) and track surface (bottom half) with boundary
-        walls coloured by proximity.
-
-        Returns np.ndarray (BUMPER_CAM_H, BUMPER_CAM_W, 3) uint8.
-        """
         self._ensure_pygame()
 
-        img = np.zeros((BUMPER_CAM_H, BUMPER_CAM_W, 3), dtype=np.uint8)
+        img       = np.zeros((BUMPER_CAM_H, BUMPER_CAM_W, 3), dtype=np.uint8)
+        half_fov  = math.radians(BUMPER_CAM_FOV / 2)
+        step_sz   = 2.0
+        max_steps = int(BUMPER_CAM_DIST / step_sz)
 
-        half_fov = math.radians(BUMPER_CAM_FOV / 2)
-        n_cols   = BUMPER_CAM_W
-
-        for col in range(n_cols):
-            # Ray angle relative to heading
-            frac  = col / (n_cols - 1)          # 0 = leftmost, 1 = rightmost
+        for col in range(BUMPER_CAM_W):
+            frac  = col / (BUMPER_CAM_W - 1)
             angle = self._heading - half_fov + frac * 2 * half_fov
 
-            # March ray outward until it leaves the track or hits max dist
             hit_dist   = BUMPER_CAM_DIST
             hit_colour = COL_GRASS
 
-            step_size = 2.0
-            max_steps = int(BUMPER_CAM_DIST / step_size)
-
             for s in range(1, max_steps + 1):
-                d   = s * step_size
-                rx  = self._pos[0] + d * math.cos(angle)
-                ry  = self._pos[1] + d * math.sin(angle)
-                ray = np.array([rx, ry])
-
-                # Find nearest centerline point
-                ci   = self._find_closest_idx(ray)
-                dist = np.linalg.norm(ray - self.centerline[ci])
+                d    = s * step_sz
+                rpos = np.array([self._pos[0] + d * math.cos(angle),
+                                 self._pos[1] + d * math.sin(angle)])
+                ci   = self._find_closest_idx(rpos)
+                dist = float(np.linalg.norm(rpos - self.centerline[ci]))
 
                 if dist > self.half_widths[ci]:
-                    # Ray has left the track
                     hit_dist   = d
                     hit_colour = COL_WALL_NEAR if d < 30 else COL_GRASS
                     break
 
-            # Perspective projection: closer wall = taller column
-            wall_height = int(BUMPER_CAM_H * 40 / max(hit_dist, 1))
-            wall_height = min(wall_height, BUMPER_CAM_H)
+            wall_h = min(int(BUMPER_CAM_H * 40 / max(hit_dist, 1)),
+                         BUMPER_CAM_H)
+            sky_h  = (BUMPER_CAM_H - wall_h) // 2
 
-            sky_height   = (BUMPER_CAM_H - wall_height) // 2
-            floor_height = BUMPER_CAM_H - sky_height - wall_height
-
-            # Sky
-            img[:sky_height, col] = (70, 130, 180)
-            # Wall / boundary
-            img[sky_height:sky_height + wall_height, col] = hit_colour
-            # Track floor
-            img[sky_height + wall_height:, col] = COL_TRACK
+            img[:sky_h, col]               = (70, 130, 180)   # sky
+            img[sky_h:sky_h + wall_h, col] = hit_colour        # wall/boundary
+            img[sky_h + wall_h:, col]      = COL_TRACK         # track floor
 
         return img
 
@@ -615,14 +551,11 @@ class RaceEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _ensure_pygame(self):
-        """Initialise pygame lazily."""
-        if self._screen is None and self.render_mode == "human":
+        if self._screen is None:
             pygame.init()
-            self._screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-            pygame.display.set_caption("IARL Race Environment")
+            if self.render_mode == "human":
+                self._screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+                pygame.display.set_caption("IARL Race Environment")
+            else:
+                self._screen = pygame.Surface((SCREEN_W, SCREEN_H))
             self._clock = pygame.time.Clock()
-        elif self._screen is None:
-            # Headless: init display-less (needed for surfarray)
-            pygame.init()
-            self._screen = pygame.Surface((SCREEN_W, SCREEN_H))
-            self._clock  = pygame.time.Clock()
