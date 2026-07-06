@@ -236,9 +236,16 @@ class RaceEnv(gym.Env):
 
     metadata = {"render_modes": ["human"], "render_fps": FPS}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, render_top_down=True):
         super().__init__()
         self.render_mode = render_mode
+        # When False, info["top_down"] is not rendered each step (set to
+        # None instead). Skips the per-step top-down surface + polygon
+        # draw + array conversion entirely. Default True preserves the
+        # original interface for anything that reads info["top_down"]
+        # (test_env.py, Phase 3's LLM-assisted arm). Arm 1 sets this False
+        # since it's blind by design and never reads that key.
+        self._render_top_down_enabled = render_top_down
 
         # Build track geometry
         raw_pts, raw_hws = _build_track()
@@ -491,9 +498,22 @@ class RaceEnv(gym.Env):
         surf = self._render_top_down_surface(w=TOP_DOWN_W, h=TOP_DOWN_H)
         return pygame.surfarray.array3d(surf).transpose(1, 0, 2)
 
+# ------------------------------------------------------------------
+    # Rendering — bumper cam (ray-cast, vectorized)
     # ------------------------------------------------------------------
-    # Rendering — bumper cam (ray-cast)
-    # ------------------------------------------------------------------
+    #
+    # Same semantics as the original per-ray Python loop: for each of
+    # BUMPER_CAM_W columns, march outward in step_sz increments up to
+    # BUMPER_CAM_DIST, find the first point that falls outside the track
+    # boundary (nearest centerline point's half_width), and use that
+    # distance to draw sky/wall/floor for that column.
+    #
+    # The only change is *how* "nearest centerline point" is computed for
+    # every sample point: instead of calling _find_closest_idx (a full
+    # O(N) brute-force search) once per sample point in a Python loop
+    # (~9,600 calls/frame), all sample points across all rays are batched
+    # into a single vectorized numpy computation. Output is numerically
+    # identical to the original; only the internal computation path changed.
 
     def _render_bumper_cam(self):
         self._ensure_pygame()
@@ -503,27 +523,55 @@ class RaceEnv(gym.Env):
         step_sz   = 2.0
         max_steps = int(BUMPER_CAM_DIST / step_sz)
 
-        for col in range(BUMPER_CAM_W):
-            frac  = col / (BUMPER_CAM_W - 1)
-            angle = self._heading - half_fov + frac * 2 * half_fov
+        # --- Ray angles, one per column ---
+        cols   = np.arange(BUMPER_CAM_W)
+        fracs  = cols / (BUMPER_CAM_W - 1)
+        angles = self._heading - half_fov + fracs * 2 * half_fov      # (W,)
 
-            hit_dist   = BUMPER_CAM_DIST
-            hit_colour = COL_GRASS
+        # --- Sample distances along each ray ---
+        steps           = np.arange(1, max_steps + 1, dtype=np.float64)  # (S,)
+        dists_along_ray = steps * step_sz                                # (S,)
 
-            for s in range(1, max_steps + 1):
-                d    = s * step_sz
-                rpos = np.array([self._pos[0] + d * math.cos(angle),
-                                 self._pos[1] + d * math.sin(angle)])
-                ci   = self._find_closest_idx(rpos)
-                dist = float(np.linalg.norm(rpos - self.centerline[ci]))
+        cos_a = np.cos(angles)   # (W,)
+        sin_a = np.sin(angles)   # (W,)
 
-                if dist > self.half_widths[ci]:
-                    hit_dist   = d
-                    hit_colour = COL_WALL_NEAR if d < 30 else COL_GRASS
-                    break
+        # sample_pts[col, step] = pos + d * (cos(angle_col), sin(angle_col))
+        sample_x = self._pos[0] + dists_along_ray[None, :] * cos_a[:, None]   # (W, S)
+        sample_y = self._pos[1] + dists_along_ray[None, :] * sin_a[:, None]   # (W, S)
 
-            wall_h = min(int(BUMPER_CAM_H * 40 / max(hit_dist, 1)),
-                         BUMPER_CAM_H)
+        W = BUMPER_CAM_W
+        S = max_steps
+        flat_pts = np.stack([sample_x.ravel(), sample_y.ravel()], axis=1)     # (W*S, 2)
+
+        # --- Batched nearest-centerline-point lookup for ALL sample points at once ---
+        # Equivalent to calling _find_closest_idx once per point, but done as
+        # a single vectorized computation instead of W*S separate Python calls.
+        c = self.centerline                                                    # (N, 2)
+        pt_sq = np.sum(flat_pts * flat_pts, axis=1, keepdims=True)             # (M, 1)
+        c_sq  = np.sum(c * c, axis=1)[None, :]                                 # (1, N)
+        cross = flat_pts @ c.T                                                 # (M, N)
+        dist2 = pt_sq - 2.0 * cross + c_sq                                     # (M, N)
+        dist2 = np.maximum(dist2, 0.0)  # guard tiny negative values from fp error
+
+        closest_idx    = np.argmin(dist2, axis=1)                             # (M,)
+        dist_to_center = np.sqrt(dist2[np.arange(dist2.shape[0]), closest_idx])  # (M,)
+        hw_at_closest   = self.half_widths[closest_idx]                       # (M,)
+
+        outside = (dist_to_center > hw_at_closest).reshape(W, S)              # (W, S)
+
+        # First step index per column where the ray leaves the track boundary.
+        # np.argmax returns 0 if no True is present, so any_hit disambiguates
+        # "hit at step 0" from "never hit within max_steps".
+        any_hit        = outside.any(axis=1)                                   # (W,)
+        first_hit_step = np.argmax(outside, axis=1)                            # (W,)
+        hit_dist = np.where(any_hit, dists_along_ray[first_hit_step], BUMPER_CAM_DIST)  # (W,)
+
+        # --- Draw columns (same per-column drawing logic as before) ---
+        for col in range(W):
+            d = float(hit_dist[col])
+            hit_colour = COL_WALL_NEAR if (any_hit[col] and d < 30) else COL_GRASS
+
+            wall_h = min(int(BUMPER_CAM_H * 40 / max(d, 1)), BUMPER_CAM_H)
             sky_h  = (BUMPER_CAM_H - wall_h) // 2
 
             img[:sky_h, col]               = (70, 130, 180)   # sky
@@ -532,19 +580,22 @@ class RaceEnv(gym.Env):
 
         return img
 
-    # ------------------------------------------------------------------
+   # ------------------------------------------------------------------
     # Info dict
     # ------------------------------------------------------------------
 
     def _build_info(self):
-        return {
-            "top_down"       : self._render_top_down_array(),
+        info = {
+            "top_down"       : None,
             "speed"          : float(self._speed),
             "heading"        : float(self._heading),
             "checkpoint"     : self._next_checkpoint,
             "lap"            : self._laps_completed,
             "track_progress" : self._track_progress(),
         }
+        if self._render_top_down_enabled:
+            info["top_down"] = self._render_top_down_array()
+        return info
 
     # ------------------------------------------------------------------
     # Pygame helpers
