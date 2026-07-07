@@ -219,3 +219,6 @@ __marimo__/
 
 # Project specific
 tests/test_outputs/arm1_outputs/
+arm1_outputs/arm1_outputs/
+arm2_outputs/
+tests/test_outputs/
