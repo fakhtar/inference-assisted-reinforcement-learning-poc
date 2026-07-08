@@ -138,19 +138,28 @@ def _build_track():
     # Verified: start=(550,490), end=(730,310). Gap to S1 end: 0.00px.
     arc(cx=550, cy=310, r=180, a_start_deg=90, a_end_deg=0, steps=20, hw=34)
 
-    # S3: Right connector — short vertical, car heading upward
-    # Verified: start=(730,310), end=(730,200). Gap to S2 end: 0.00px.
-    straight(730, 310, 730, 200, steps=8, hw=30)
-
-    # S4: Hairpin — tight, narrow (hw=20, full width 40px vs 76px on straight)
-    # Center (650,200), r=80. Arc 0°->180°.
-    # Verified: start=(730,200), end=(570,200). Gap to S3 end: 0.00px.
-    # Car enters heading upward, exits heading downward-left.
-    arc(cx=650, cy=200, r=80, a_start_deg=0, a_end_deg=180, steps=28, hw=20)
-
-    # S5: Top straight — car heading left
-    # Verified: start=(570,200). Gap to S4 end: 0.00px.
-    straight(570, 200, 200, 200, steps=24, hw=30)
+    # S3: Right connector — shortened from the original (was 730,310 to
+    # 730,200). Ends at 730,255 instead of 730,200 -- this shift is what
+    # gives the hairpin arc a geometrically valid entry point. See notes
+    # below for why the original 730,200 endpoint made tangent-matching
+    # provably impossible.
+    straight(730, 310, 730, 255, steps=6, hw=30)
+ 
+    # S4: Hairpin — replaced. The original was a semicircle (180-degree
+    # sweep), which can ONLY connect points with exactly OPPOSITE tangent
+    # directions by construction. This hairpin needs to connect a NORTH-
+    # heading entry to a WEST-heading exit -- 90 degrees apart, not 180.
+    # No semicircle could ever have tangent-matched here, regardless of
+    # radius or position. Replaced with a single genuine 90-degree arc,
+    # radius 55 (2.5x the car's ~22.2px minimum turning radius), tangent-
+    # matched exactly at both ends by construction.
+    arc(cx=675, cy=255, r=55, a_start_deg=0, a_end_deg=-90, steps=24, hw=26)
+ 
+    # S5: Top straight — lengthened from the original (was 570,200 to
+    # 200,200). Now starts at 675,200 instead of 570,200, absorbing the
+    # hairpin's new exit point. Still ends at 200,200, unchanged, so S6
+    # and everything downstream needs no changes at all.
+    straight(675, 200, 200, 200, steps=20, hw=30)
 
     # S6: Left sweeper arc
     # Center (200,310), r=110. Arc 270°->180°.
@@ -236,16 +245,19 @@ class RaceEnv(gym.Env):
 
     metadata = {"render_modes": ["human"], "render_fps": FPS}
 
-    def __init__(self, render_mode=None, render_top_down=True):
+    def __init__(self, render_mode=None, render_top_down=True, render_front_camera=True):
         super().__init__()
         self.render_mode = render_mode
-        # When False, info["top_down"] is not rendered each step (set to
-        # None instead). Skips the per-step top-down surface + polygon
-        # draw + array conversion entirely. Default True preserves the
-        # original interface for anything that reads info["top_down"]
-        # (test_env.py, Phase 3's LLM-assisted arm). Arm 1 sets this False
-        # since it's blind by design and never reads that key.
         self._render_top_down_enabled = render_top_down
+        # When False, the front_camera (bumper-cam raycast) observation is
+        # not rendered -- step()/reset() return a zero array of the correct
+        # shape/dtype instead. For Arm 2/Arm 3, which use a structured-state
+        # vector via a wrapper instead of pixels, this skips the entire
+        # raycast computation (the majority of step() cost) since the image
+        # would otherwise be computed and immediately discarded. Default
+        # True preserves the original interface for Arm 1 and anything else
+        # that actually reads the returned observation.
+        self._render_front_camera_enabled = render_front_camera
 
         # Build track geometry
         raw_pts, raw_hws = _build_track()
@@ -303,7 +315,7 @@ class RaceEnv(gym.Env):
         self._steps           = 0
         self._closest_idx     = 0
 
-        obs  = self._render_bumper_cam()
+        obs  = self._get_observation()
         info = self._build_info()
         return obs, info
 
@@ -333,7 +345,7 @@ class RaceEnv(gym.Env):
         # 6. Time penalty
         reward += TIME_PENALTY
 
-        obs  = self._render_bumper_cam()
+        obs  = self._get_observation()
         info = self._build_info()
         return obs, reward, terminated, False, info
 
@@ -396,10 +408,20 @@ class RaceEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _check_checkpoints(self):
-        cp_idx     = self.checkpoint_indices[self._next_checkpoint]
-        dist_to_cp = float(np.linalg.norm(self._pos - self.centerline[cp_idx]))
-
-        if dist_to_cp < self.half_widths[cp_idx] * 1.5:
+        # Index-distance check instead of raw Euclidean distance to the
+        # checkpoint's position. _closest_idx is now constrained to a
+        # local window each step (see _find_closest_idx), so it can only
+        # reach a checkpoint's index by genuinely traveling the arc-length
+        # path there -- it can no longer trigger early via spatial
+        # proximity across a loop (e.g. a checkpoint sitting inside the
+        # hairpin being reachable in a straight line from the approach
+        # corridor before the car has actually driven the turn).
+        cp_idx = self.checkpoint_indices[self._next_checkpoint]
+        N = self.N
+        raw_dist = abs(self._closest_idx - cp_idx)
+        idx_dist = min(raw_dist, N - raw_dist)  # wraparound-aware
+ 
+        if idx_dist <= 3:
             self._next_checkpoint += 1
             if self._next_checkpoint >= len(self.checkpoint_indices):
                 self._next_checkpoint = 0
@@ -412,9 +434,32 @@ class RaceEnv(gym.Env):
     # Geometry helpers
     # ------------------------------------------------------------------
 
-    def _find_closest_idx(self, pos):
-        dists = np.linalg.norm(self.centerline - pos, axis=1)
-        return int(np.argmin(dists))
+    def _find_closest_idx(self, pos, max_steps=3):
+        # Incremental hill-climbing instead of a windowed/global search.
+        # Only compares against immediate neighbors (idx-1, idx+1) and
+        # takes one step at a time, up to max_steps per call. This can
+        # only reach a distant index by continuously improving through
+        # every point in between -- it cannot skip across a loop the way
+        # any fixed-size window search can (verified: window search still
+        # jumped near the hairpin even at window=5; hill-climbing does
+        # not, across the same stress tests). max_steps=3 comfortably
+        # covers real per-step movement (observed max: 1 index at
+        # realistic speeds) with margin to spare.
+        N = self.N
+        idx = self._closest_idx if self._closest_idx is not None else 0
+        cur_dist = np.linalg.norm(self.centerline[idx] - pos)
+        for _ in range(max_steps):
+            idx_fwd = (idx + 1) % N
+            idx_bwd = (idx - 1) % N
+            d_fwd = np.linalg.norm(self.centerline[idx_fwd] - pos)
+            d_bwd = np.linalg.norm(self.centerline[idx_bwd] - pos)
+            if d_fwd <= cur_dist and d_fwd <= d_bwd:
+                idx, cur_dist = idx_fwd, d_fwd
+            elif d_bwd < cur_dist:
+                idx, cur_dist = idx_bwd, d_bwd
+            else:
+                break  # neither neighbor improves -- converged
+        return idx
 
     def _track_progress(self):
         return float(self.arc_lengths[self._closest_idx] / self.total_length)
@@ -514,7 +559,14 @@ class RaceEnv(gym.Env):
     # (~9,600 calls/frame), all sample points across all rays are batched
     # into a single vectorized numpy computation. Output is numerically
     # identical to the original; only the internal computation path changed.
-
+    def _get_observation(self):
+        if self._render_front_camera_enabled:
+            return self._render_bumper_cam()
+        # Cheap placeholder matching observation_space shape/dtype. Content
+        # is never read by anything -- Arm 2/3 wrappers replace this with
+        # their own structured-state observation entirely.
+        return np.zeros((BUMPER_CAM_H, BUMPER_CAM_W, 3), dtype=np.uint8)
+    
     def _render_bumper_cam(self):
         self._ensure_pygame()
 

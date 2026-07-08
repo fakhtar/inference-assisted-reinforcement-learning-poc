@@ -222,3 +222,4 @@ tests/test_outputs/arm1_outputs/
 arm1_outputs/
 arm2_outputs/
 tests/test_outputs/
+crash_frame.png
