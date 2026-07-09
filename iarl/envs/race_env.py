@@ -83,7 +83,7 @@ COL_WALL_NEAR     = (220,  80,  80)
 # Track definition
 # ---------------------------------------------------------------------------
 
-def _build_track():
+def _build_track_basra_loop():
     """
     Build the Basra Loop — a clean 7-segment closed circuit.
 
@@ -173,7 +173,135 @@ def _build_track():
 
     return points, widths
 
+def _build_track_circle():
+    """
+    Track 2 of the difficulty sweep: Circle. Easiest-end anchor --
+    constant curvature, no direction reversals, no tight spots.
+    Point[0] positioned so its tangent points due east (0 deg),
+    matching reset()'s hardcoded starting heading -- verified via
+    the tracks/verify.py Stage 0 check before this was added here.
+    """
+    import math
+    cx, cy, r, steps, hw = 400, 300, 278, 140, 32
+    points, widths = [], []
+    start_offset = -90  # degrees, gives east-facing tangent at point[0]
+    for i in range(steps + 1):
+        a = math.radians(start_offset + 360 * i / steps)
+        points.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        widths.append(hw)
+    return points, widths
 
+def _build_track_oval():
+    """
+    Track 3 of the difficulty sweep: Oval. Easy end of the spectrum --
+    two long straights connected by generous semicircular U-turns
+    (R=90px, 4x the car's min turning radius). Both turns are 180-degree
+    parallel-tangent connections -- the simple case a semicircle is
+    built for, unlike the original hairpin's perpendicular-tangent
+    problem.
+    Point[0] starts on the bottom straight heading east, matching
+    reset()'s hardcoded starting heading -- verified via tracks/verify.py
+    Stage 0 before this was added here.
+    """
+    import math
+ 
+    def arc(cx, cy, r, a_start_deg, a_end_deg, steps):
+        return [(cx + r*math.cos(math.radians(a_start_deg + (i/steps)*(a_end_deg-a_start_deg))),
+                 cy + r*math.sin(math.radians(a_start_deg + (i/steps)*(a_end_deg-a_start_deg))))
+                for i in range(steps+1)]
+ 
+    def straight(x0, y0, x1, y1, steps):
+        return [(x0+(i/steps)*(x1-x0), y0+(i/steps)*(y1-y0)) for i in range(steps+1)]
+ 
+    cx_left, cx_right, cy, R, hw = 105, 695, 300, 90, 30
+    straight_steps, arc_steps = 40, 30
+ 
+    points, widths = [], []
+    def add(pts, w): points.extend(pts); widths.extend([w]*len(pts))
+ 
+    add(straight(cx_left, cy+R, cx_right, cy+R, straight_steps), hw)   # bottom straight, east
+    add(arc(cx_right, cy, R, 90, -90, arc_steps), hw)                   # right U-turn
+    add(straight(cx_right, cy-R, cx_left, cy-R, straight_steps), hw)    # top straight, west
+    add(arc(cx_left, cy, R, -90, -270, arc_steps), hw)                  # left U-turn, closes loop
+ 
+    return points, widths 
+
+def _build_track_rectangle():
+    """
+    Track 4 of the difficulty sweep: Rectangle. Moderate difficulty --
+    4 sharp-but-feasible corners, minimal rounding (R=35px, margin
+    +12.8px over the car's min turning radius -- real but deliberately
+    tighter than Oval's). Each corner's incoming/outgoing edges are
+    offset in both x and y, so unlike the original hairpin there's no
+    same-coordinate degeneracy -- a single quarter-circle fillet per
+    corner works cleanly.
+    Point[0] starts on the bottom straight heading east, matching
+    reset()'s hardcoded starting heading.
+    """
+    import math
+ 
+    def arc(cx, cy, r, a_start_deg, a_end_deg, steps):
+        return [(cx + r*math.cos(math.radians(a_start_deg + (i/steps)*(a_end_deg-a_start_deg))),
+                 cy + r*math.sin(math.radians(a_start_deg + (i/steps)*(a_end_deg-a_start_deg))))
+                for i in range(steps+1)]
+ 
+    def straight(x0, y0, x1, y1, steps):
+        return [(x0+(i/steps)*(x1-x0), y0+(i/steps)*(y1-y0)) for i in range(steps+1)]
+ 
+    x_left, x_right, y_top, y_bottom, R, hw = 110, 690, 135, 465, 35, 28
+    straight_steps, arc_steps = 40, 20
+ 
+    points, widths = [], []
+    def add(pts, w): points.extend(pts); widths.extend([w]*len(pts))
+ 
+    add(straight(x_left+R, y_bottom, x_right-R, y_bottom, straight_steps), hw)   # bottom, east
+    add(arc(x_right-R, y_bottom-R, R, 90, 0, arc_steps), hw)                      # BR fillet
+    add(straight(x_right, y_bottom-R, x_right, y_top+R, straight_steps), hw)     # right, north
+    add(arc(x_right-R, y_top+R, R, 0, -90, arc_steps), hw)                       # TR fillet
+    add(straight(x_right-R, y_top, x_left+R, y_top, straight_steps), hw)        # top, west
+    add(arc(x_left+R, y_top+R, R, 270, 180, arc_steps), hw)                      # TL fillet
+    add(straight(x_left, y_top+R, x_left, y_bottom-R, straight_steps), hw)      # left, south
+    add(arc(x_left+R, y_bottom-R, R, 180, 90, arc_steps), hw)                    # BL fillet, closes loop
+ 
+    return points, widths
+
+def _build_track_spur():
+    """
+    Track 5 of the difficulty sweep: Spur. Moderate difficulty -- a
+    single isolated elbow/protrusion on an otherwise circular base.
+    Built as ONE continuous curve (Gaussian bump in radius vs. angle)
+    rather than a branching neck that separates and rejoins -- this
+    guarantees tangent continuity everywhere by construction, avoiding
+    the junction-matching problem the original hairpin needed fixing.
+    Margin +28.0px over the car's min turning radius at the tightest
+    point (the bump's peak curvature). Total length ~1749px.
+    Point[0] starts heading east, matching reset()'s hardcoded start.
+    """
+    import math
+ 
+    cx, cy, base_r, bump_amplitude = 400, 300, 258, 110
+    bump_center_deg, bump_width_deg, steps, hw = 45, 35, 200, 30
+ 
+    points, widths = [], []
+    start_offset = -90
+    for i in range(steps + 1):
+        theta_deg = start_offset + 360 * i / steps
+        theta = math.radians(theta_deg)
+        d = (theta_deg - bump_center_deg + 180) % 360 - 180
+        bump = bump_amplitude * math.exp(-(d / (bump_width_deg / 2)) ** 2)
+        r = base_r + bump
+        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+        widths.append(hw)
+ 
+    return points, widths
+
+TRACK_REGISTRY = {
+    "basra_loop": _build_track_basra_loop,
+    "circle": _build_track_circle,
+    "oval": _build_track_oval,
+    "rectangle": _build_track_rectangle,
+    "spur": _build_track_spur,
+}
 def _compute_track_geometry(raw_points, raw_widths):
     """
     Deduplicate, compute per-point normals, build left/right boundaries.
@@ -245,22 +373,20 @@ class RaceEnv(gym.Env):
 
     metadata = {"render_modes": ["human"], "render_fps": FPS}
 
-    def __init__(self, render_mode=None, render_top_down=True, render_front_camera=True):
+    def __init__(self, render_mode=None, render_top_down=True, render_front_camera=True,
+                 track_name="basra_loop"):
         super().__init__()
         self.render_mode = render_mode
         self._render_top_down_enabled = render_top_down
-        # When False, the front_camera (bumper-cam raycast) observation is
-        # not rendered -- step()/reset() return a zero array of the correct
-        # shape/dtype instead. For Arm 2/Arm 3, which use a structured-state
-        # vector via a wrapper instead of pixels, this skips the entire
-        # raycast computation (the majority of step() cost) since the image
-        # would otherwise be computed and immediately discarded. Default
-        # True preserves the original interface for Arm 1 and anything else
-        # that actually reads the returned observation.
         self._render_front_camera_enabled = render_front_camera
-
+        self.track_name = track_name
+ 
         # Build track geometry
-        raw_pts, raw_hws = _build_track()
+        if track_name not in TRACK_REGISTRY:
+            raise ValueError(
+                f"Unknown track_name '{track_name}'. Available: {list(TRACK_REGISTRY.keys())}"
+            )
+        raw_pts, raw_hws = TRACK_REGISTRY[track_name]()
         (self.centerline,
          self.half_widths,
          self.left_boundary,

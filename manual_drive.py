@@ -28,6 +28,7 @@ Usage:
     python manual_drive.py
 """
 
+import argparse
 import math
 import sys
 import time
@@ -62,7 +63,13 @@ def _lateral_offset_px(base_env):
 
 
 def main():
-    env = gym.make("iarl/RaceTrack-v0", render_mode="human")
+    parser = argparse.ArgumentParser(description="Manual keyboard control of the RaceEnv")
+    parser.add_argument("--track", type=str, default="basra_loop",
+                         help="Track to drive (basra_loop, circle, ...). "
+                              "Default matches all existing trained models.")
+    args = parser.parse_args()
+
+    env = gym.make("iarl/RaceTrack-v0", render_mode="human", track_name=args.track)
     base_env = env.unwrapped
 
     obs, info = env.reset()
