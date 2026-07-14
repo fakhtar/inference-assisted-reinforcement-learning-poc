@@ -185,7 +185,7 @@ def _build_track_circle():
     cx, cy, r, steps, hw = 400, 300, 278, 140, 32
     points, widths = [], []
     start_offset = -90  # degrees, gives east-facing tangent at point[0]
-    for i in range(steps + 1):
+    for i in range(steps):
         a = math.radians(start_offset + 360 * i / steps)
         points.append((cx + r * math.cos(a), cy + r * math.sin(a)))
         widths.append(hw)
@@ -284,7 +284,7 @@ def _build_track_spur():
  
     points, widths = [], []
     start_offset = -90
-    for i in range(steps + 1):
+    for i in range(steps):
         theta_deg = start_offset + 360 * i / steps
         theta = math.radians(theta_deg)
         d = (theta_deg - bump_center_deg + 180) % 360 - 180
@@ -295,12 +295,129 @@ def _build_track_spur():
  
     return points, widths
 
+def _build_track_bramble():
+    """
+    Track 6 of the difficulty sweep: Bramble. Hard difficulty -- 4
+    lobes with GENUINE concave necks (rose/clover curve: r(theta) =
+    base_r + amplitude*cos(4*theta)), not just convex bumps on a
+    circle -- matches the original sketch's distinct, narrow-waisted
+    lobes. Still a single continuous function, no branching junctions
+    to tangent-match. Margin +22.6px over the car's min turning radius.
+    Total length ~1747px. Uses range(steps) (not steps+1) to avoid
+    the loop-closure duplicate point bug found during development.
+    """
+    import math
+ 
+    cx, cy, base_r, amplitude, k = 400, 300, 232, 55, 4
+    steps, hw, start_offset = 280, 28, -90.0
+ 
+    points, widths = [], []
+    for i in range(steps):
+        theta_deg = start_offset + 360 * i / steps
+        theta = math.radians(theta_deg)
+        r = base_r + amplitude * math.cos(k * theta)
+        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+        widths.append(hw)
+ 
+    return points, widths
+
+def _build_track_sawtooth():
+    """
+    Track 7 of the difficulty sweep: Sawtooth. Hardest difficulty --
+    3 peaks, 2 valleys, 5 sharp vertices in close sequence. Built as
+    straight segments + fillet arcs at each vertex (generalized polygon
+    fillet, each vertex's own turn angle, not assumed 90 degrees like
+    Rectangle).
+ 
+    The vertex spacing was widened from the original sketch-matched
+    positions specifically to clear a fillet-collision: with R=38, the
+    P1-to-V1 edge originally needed 195.3px for both endpoints' fillets
+    but only had 193.1px available (a ~2px overlap) -- exactly the risk
+    flagged before building this track (5 tight vertices in close
+    sequence). Widening peak/valley spacing resolved it with real
+    margin on every edge.
+ 
+    Margin +15.8px over the car's min turning radius (tighter than
+    every other track except Bramble/Rectangle, appropriately -- this
+    is meant to be the hardest config). Total length ~1780px.
+    """
+    import math
+ 
+    vertices = [
+        (747.5, 457.9),  # BR -- index 0; the loop builds the edge feeding
+                          # INTO each vertex, so putting BR first makes the
+                          # BL->BR wrap-around edge come out as point[0],
+                          # heading east -- matching reset()'s hardcoded start.
+        (600.1, 78.9),   # P3
+        (515.8, 284.2),  # V2
+        (431.6, 78.9),   # P2
+        (347.4, 284.2),  # V1
+        (263.1, 78.9),   # P1
+        (126.2, 489.5),  # BL -- last vertex, closes loop as edge 0
+    ]
+    n = len(vertices)
+    hw, R, straight_steps, arc_steps = 27, 38, 25, 16
+ 
+    fillet_starts, fillet_ends, centers, a_starts, a_ends, trims = [], [], [], [], [], []
+    for i in range(n):
+        p_prev = vertices[(i - 1) % n]
+        p_curr = vertices[i]
+        p_next = vertices[(i + 1) % n]
+        v_in = (p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
+        v_out = (p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+        len_in = math.hypot(*v_in); len_out = math.hypot(*v_out)
+        u_in = (v_in[0] / len_in, v_in[1] / len_in)
+        u_out = (v_out[0] / len_out, v_out[1] / len_out)
+        angle_in = math.atan2(u_in[1], u_in[0])
+        angle_out = math.atan2(u_out[1], u_out[0])
+        turn = (angle_out - angle_in + math.pi) % (2 * math.pi) - math.pi
+        interior_angle = math.pi - abs(turn)
+        trim = R / math.tan(interior_angle / 2) if interior_angle > 1e-6 else R * 1000
+        trims.append(trim)
+ 
+        fs = (p_curr[0] - u_in[0] * trim, p_curr[1] - u_in[1] * trim)
+        fe = (p_curr[0] + u_out[0] * trim, p_curr[1] + u_out[1] * trim)
+        sign = 1 if turn > 0 else -1
+        normal_in = (-u_in[1], u_in[0])
+        center = (fs[0] + normal_in[0] * R * sign, fs[1] + normal_in[1] * R * sign)
+        a_s = math.degrees(math.atan2(fs[1] - center[1], fs[0] - center[0]))
+        a_e = math.degrees(math.atan2(fe[1] - center[1], fe[0] - center[0]))
+        if sign > 0:
+            while a_e < a_s: a_e += 360
+            while a_e - a_s > 180: a_e -= 360
+        else:
+            while a_e > a_s: a_e -= 360
+            while a_s - a_e > 180: a_e += 360
+ 
+        fillet_starts.append(fs); fillet_ends.append(fe); centers.append(center)
+        a_starts.append(a_s); a_ends.append(a_e)
+ 
+    def straight(p0, p1, steps):
+        return [(p0[0] + (k/steps)*(p1[0]-p0[0]), p0[1] + (k/steps)*(p1[1]-p0[1]))
+                for k in range(steps + 1)]
+ 
+    points, widths = [], []
+    for i in range(n):
+        prev_end = fillet_ends[(i - 1) % n]
+        this_start = fillet_starts[i]
+        for pt in straight(prev_end, this_start, straight_steps):
+            points.append(pt); widths.append(hw)
+        for j in range(arc_steps + 1):
+            t = j / arc_steps
+            a = math.radians(a_starts[i] + t * (a_ends[i] - a_starts[i]))
+            points.append((centers[i][0] + R*math.cos(a), centers[i][1] + R*math.sin(a)))
+            widths.append(hw)
+ 
+    return points, widths
+
 TRACK_REGISTRY = {
     "basra_loop": _build_track_basra_loop,
     "circle": _build_track_circle,
     "oval": _build_track_oval,
     "rectangle": _build_track_rectangle,
     "spur": _build_track_spur,
+    "bramble": _build_track_bramble,
+    "sawtooth": _build_track_sawtooth,
 }
 def _compute_track_geometry(raw_points, raw_widths):
     """

@@ -21,15 +21,18 @@ def build_spur_track(cx=400, cy=300, base_r=258, bump_amplitude=110,
     bump_amplitude=110 -- a clear, visible protrusion.
     bump_width_deg=35 -- controls how tight the bump's curvature gets;
     verified via the pipeline (margin +28.0px over car's min radius).
+
+    Uses range(steps), NOT range(steps+1) -- avoids duplicating point[0]
+    at the loop closure (see circle.py for the full explanation; caused
+    a real failure on Bramble, harmless here but fixed at the source).
     """
     points, widths = [], []
-    start_offset = -90  # matches Circle's fix: point[0] tangent faces east
-    for i in range(steps + 1):
+    start_offset = -90
+    for i in range(steps):
         theta_deg = start_offset + 360 * i / steps
         theta = math.radians(theta_deg)
 
-        # Gaussian bump added to the base radius, centered at bump_center_deg
-        d = (theta_deg - bump_center_deg + 180) % 360 - 180  # signed angular distance, wrapped
+        d = (theta_deg - bump_center_deg + 180) % 360 - 180
         bump = bump_amplitude * math.exp(-(d / (bump_width_deg / 2)) ** 2)
         r = base_r + bump
 

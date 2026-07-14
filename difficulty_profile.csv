@@ -1,0 +1,8 @@
+track,total_length_px,curvature_margin_px,tightest_radius_px,autopilot_clean_margin_px,verified_pass
+basra_loop,1684.3,32.8,55.0,20.3,True
+circle,1746.6,255.8,278.0,29.7,True
+oval,1745.2,67.8,90.0,26.5,True
+rectangle,1759.9,12.8,35.0,22.7,True
+spur,1749.2,28.0,50.3,25.4,True
+bramble,1746.8,22.6,44.8,26.2,True
+sawtooth,1779.7,15.8,38.0,20.6,True

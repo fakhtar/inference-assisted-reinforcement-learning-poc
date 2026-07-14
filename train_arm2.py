@@ -18,8 +18,10 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import time
+from collections import deque
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -52,11 +54,15 @@ TARGET_KL = 0.03  # caps policy-update size; Arm 1's final rollouts showed
 
 COLLISION_REWARD_THRESHOLD = -5.0
 
-OUTPUT_DIR = "arm2_outputs"
-CSV_PATH = os.path.join(OUTPUT_DIR, "arm2_training_log.csv")
-CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
-MODEL_PATH = os.path.join(OUTPUT_DIR, "arm2_ppo_final.zip")
-TENSORBOARD_DIR = os.path.join(OUTPUT_DIR, "tb")
+# "Reliable completion" -- the operational definition we're locking in for
+# the whole sweep, since we agreed to checkpoint the model at this point
+# specifically (not just the final, post-convergence model). Defined as:
+# the first episode where the trailing RELIABLE_WINDOW episodes have a lap
+# completion rate >= RELIABLE_THRESHOLD. 20/0.90 means >=18 of the last 20
+# episodes completed the lap -- strict enough to mean something, lenient
+# enough to not be thrown off by one unlucky episode on harder tracks.
+RELIABLE_WINDOW = 20
+RELIABLE_THRESHOLD = 0.90
 
 
 # ---------------------------------------------------------------------------
@@ -66,11 +72,12 @@ TENSORBOARD_DIR = os.path.join(OUTPUT_DIR, "tb")
 # ---------------------------------------------------------------------------
 
 class EpisodeMetricsCallback(BaseCallback):
-    def __init__(self, csv_path, n_envs, enabled=True, verbose=1):
+    def __init__(self, csv_path, n_envs, reliable_checkpoint_path, enabled=True, verbose=1):
         super().__init__(verbose)
         self.csv_path = csv_path
         self.n_envs = n_envs
         self.enabled = enabled
+        self.reliable_checkpoint_path = reliable_checkpoint_path
         self.episode_num = 0
         self.episode_reward = np.zeros(n_envs, dtype=np.float64)
         self.episode_length = np.zeros(n_envs, dtype=np.int64)
@@ -80,6 +87,16 @@ class EpisodeMetricsCallback(BaseCallback):
         self.first_lap_logged = False
         self._csv_file = None
         self._csv_writer = None
+        # Rolling window of lap_completed values, in global episode-completion
+        # order (not per-env) -- reliable completion is a property of the
+        # policy's recent behavior overall, not any one worker's history.
+        self._recent_completions = deque(maxlen=RELIABLE_WINDOW)
+        self.reliable_completion_episode = None
+        self.reliable_completion_timestep = None
+        self.reliable_completion_wallclock = None
+        self.first_lap_episode = None
+        self.first_lap_timestep = None
+        self.first_lap_wallclock = None
 
     def _on_training_start(self) -> None:
         self.start_time = time.time()
@@ -130,11 +147,33 @@ class EpisodeMetricsCallback(BaseCallback):
 
                 if lap_completed and not self.first_lap_logged:
                     self.first_lap_logged = True
+                    self.first_lap_episode = self.episode_num
+                    self.first_lap_timestep = self.num_timesteps
+                    self.first_lap_wallclock = elapsed
                     print(
                         f"\n[MILESTONE] First lap completed -- "
                         f"episode {self.episode_num}, "
                         f"timestep {self.num_timesteps}, "
                         f"wall-clock {elapsed:.1f}s\n"
+                    )
+
+                # Reliable-completion tracking: rolling window across ALL
+                # envs in global episode-completion order.
+                self._recent_completions.append(lap_completed)
+                if (self.reliable_completion_episode is None
+                        and len(self._recent_completions) == RELIABLE_WINDOW
+                        and sum(self._recent_completions) / RELIABLE_WINDOW >= RELIABLE_THRESHOLD):
+                    self.reliable_completion_episode = self.episode_num
+                    self.reliable_completion_timestep = self.num_timesteps
+                    self.reliable_completion_wallclock = elapsed
+                    if self.reliable_checkpoint_path:
+                        self.model.save(self.reliable_checkpoint_path)
+                    print(
+                        f"\n[MILESTONE] RELIABLE completion reached -- "
+                        f"{sum(self._recent_completions)}/{RELIABLE_WINDOW} of last "
+                        f"{RELIABLE_WINDOW} episodes completed the lap. "
+                        f"episode {self.episode_num}, timestep {self.num_timesteps}, "
+                        f"wall-clock {elapsed:.1f}s. Checkpoint saved.\n"
                     )
 
                 if self.verbose and self.episode_num % 20 == 0:
@@ -162,6 +201,9 @@ class EpisodeMetricsCallback(BaseCallback):
 
 def main():
     parser = argparse.ArgumentParser(description="IARL Phase 2 Arm 2 training (structured-state PPO baseline)")
+    parser.add_argument("--track", type=str, default="basra_loop",
+                         help="Which track to train on (basra_loop, circle, oval, "
+                              "rectangle, spur, bramble, sawtooth).")
     parser.add_argument("--total-timesteps", type=int, default=DEFAULT_TOTAL_TIMESTEPS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true")
@@ -178,11 +220,22 @@ def main():
 
     total_timesteps = 2000 if args.smoke_test else args.total_timesteps
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    # Per-track, per-seed output directory -- critical for the sweep:
+    # without this, every run overwrites the previous one's files.
+    run_dir = os.path.join("arm2_outputs", args.track, f"seed{args.seed}")
+    csv_path = os.path.join(run_dir, "arm2_training_log.csv")
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    model_path = os.path.join(run_dir, "arm2_ppo_final.zip")
+    reliable_checkpoint_path = os.path.join(run_dir, "arm2_ppo_reliable_completion.zip")
+    tensorboard_dir = os.path.join(run_dir, "tb")
+    manifest_path = os.path.join(run_dir, "manifest.json")
+
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     def make_env():
-        env = gym.make("iarl/RaceTrack-v0", render_top_down=False, render_front_camera=False)
+        env = gym.make("iarl/RaceTrack-v0", render_top_down=False, render_front_camera=False,
+                        track_name=args.track)
         env = StructuredStateWrapper(env)
         env = Monitor(env)
         return env
@@ -204,16 +257,19 @@ def main():
         verbose=1,
         seed=args.seed,
         device=args.device,
-        tensorboard_log=TENSORBOARD_DIR if args.tensorboard else None,
+        tensorboard_log=tensorboard_dir if args.tensorboard else None,
     )
 
-    metrics_callback = EpisodeMetricsCallback(csv_path=CSV_PATH, n_envs=n_envs, enabled=not args.no_csv)
+    metrics_callback = EpisodeMetricsCallback(
+        csv_path=csv_path, n_envs=n_envs,
+        reliable_checkpoint_path=reliable_checkpoint_path, enabled=not args.no_csv,
+    )
     callbacks = [metrics_callback]
 
     if not args.no_checkpoints:
         checkpoint_callback = CheckpointCallback(
             save_freq=max(args.checkpoint_freq // n_envs, 1),
-            save_path=CHECKPOINT_DIR,
+            save_path=checkpoint_dir,
             name_prefix="arm2_ppo",
         )
         callbacks.append(checkpoint_callback)
@@ -222,13 +278,15 @@ def main():
     print("=" * 70)
     print("IARL Phase 2 -- Arm 2 (structured-state PPO, full-effort baseline)")
     print("=" * 70)
+    print(f"Track       : {args.track}")
+    print(f"Seed        : {args.seed}")
     print(f"Observation : 14-dim structured state (no pixels, no CNN)")
     print(f"Action space: Discrete(5)")
     print(f"Policy      : MlpPolicy")
     print(f"Parallel envs: {n_envs} ({'SubprocVecEnv' if n_envs > 1 else 'DummyVecEnv'})")
     print(f"target_kl   : {args.target_kl}")
     print(f"Total steps : {total_timesteps:,}")
-    print(f"Log CSV     : {CSV_PATH}")
+    print(f"Log CSV     : {csv_path}")
     if not args.no_checkpoints:
         print(f"Checkpoints : every {args.checkpoint_freq:,} steps (~{approx_n_checkpoints} saves this run)")
     else:
@@ -243,16 +301,64 @@ def main():
     )
     elapsed = time.time() - start
 
-    model.save(MODEL_PATH)
+    model.save(model_path)
     print(f"\nTraining complete in {elapsed / 60:.1f} minutes.")
-    print(f"Model saved to: {MODEL_PATH}")
-    print(f"Per-episode metrics: {CSV_PATH}")
+    print(f"Model saved to: {model_path}")
+    print(f"Per-episode metrics: {csv_path}")
 
     if not metrics_callback.first_lap_logged:
         print(
             "\n[WARNING] No lap was completed within this training run. "
             "Consider increasing --total-timesteps and re-running."
         )
+    if metrics_callback.reliable_completion_episode is None:
+        print(
+            "\n[WARNING] Reliable completion threshold "
+            f"({RELIABLE_THRESHOLD:.0%} of last {RELIABLE_WINDOW} episodes) was "
+            "never reached. No reliable-completion checkpoint was saved."
+        )
+    else:
+        print(f"Reliable completion checkpoint: {reliable_checkpoint_path}")
+
+    # Manifest -- ties this run's results together with its config, for the
+    # eventual cross-track, cross-seed analysis. One of these per run dir;
+    # the aggregation script reads all of them plus each run's CSV.
+    manifest = {
+        "track": args.track,
+        "seed": args.seed,
+        "total_timesteps_requested": total_timesteps,
+        "total_timesteps_actual": model.num_timesteps,
+        "wall_clock_minutes": round(elapsed / 60, 2),
+        "n_envs": n_envs,
+        "device": args.device,
+        "hyperparameters": {
+            "n_steps": N_STEPS, "batch_size": BATCH_SIZE, "n_epochs": N_EPOCHS,
+            "learning_rate": LEARNING_RATE, "gamma": GAMMA, "clip_range": CLIP_RANGE,
+            "target_kl": args.target_kl,
+        },
+        "first_lap_completed": metrics_callback.first_lap_logged,
+        "first_lap": {
+            "episode": metrics_callback.first_lap_episode,
+            "timestep": metrics_callback.first_lap_timestep,
+            "wall_clock_s": metrics_callback.first_lap_wallclock,
+        },
+        "reliable_completion": {
+            "window": RELIABLE_WINDOW,
+            "threshold": RELIABLE_THRESHOLD,
+            "episode": metrics_callback.reliable_completion_episode,
+            "timestep": metrics_callback.reliable_completion_timestep,
+            "wall_clock_s": metrics_callback.reliable_completion_wallclock,
+        },
+        "total_episodes": metrics_callback.episode_num,
+        "csv_path": csv_path,
+        "model_path": model_path,
+        "reliable_checkpoint_path": (
+            reliable_checkpoint_path if metrics_callback.reliable_completion_episode is not None else None
+        ),
+    }
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Manifest saved to: {manifest_path}")
 
     vec_env.close()
 

@@ -1,0 +1,59 @@
+"""
+generate_difficulty_profile.py
+--------------------------------
+Runs the verification pipeline against all 7 tracks and writes a single
+CSV summarizing each one's difficulty descriptors. This is the file the
+post-training analysis script joins against training results, so the
+difficulty-vs-training-speed correlation can actually be tested rather
+than eyeballed.
+
+Usage:
+    python generate_difficulty_profile.py
+"""
+import csv
+
+from basra_loop import build_basra_loop_track
+from circle import build_circle_track
+from oval import build_oval_track
+from rectangle import build_rectangle_track
+from spur import build_spur_track
+from bramble import build_bramble_track
+from sawtooth import build_sawtooth_track
+from verify import verify_track
+
+TRACKS = [
+    ("basra_loop", build_basra_loop_track, {0}),  # skip_tangent_idx: pre-existing,
+    ("circle", build_circle_track, None),          # unrelated loop-closure issue
+    ("oval", build_oval_track, None),
+    ("rectangle", build_rectangle_track, None),
+    ("spur", build_spur_track, None),
+    ("bramble", build_bramble_track, None),
+    ("sawtooth", build_sawtooth_track, None),
+]
+
+rows = []
+for name, builder, skip_idx in TRACKS:
+    points, widths = builder()
+    result = verify_track(points, widths, name, skip_tangent_idx=skip_idx)
+    rows.append({
+        "track": name,
+        "total_length_px": round(result["total_length"], 1),
+        "curvature_margin_px": round(result["curvature_margin"], 1),
+        "tightest_radius_px": round(result["curvature_worst_radius"], 1),
+        "autopilot_clean_margin_px": round(result["autopilot_clean_margin"], 1),
+        "verified_pass": result["overall_pass"],
+    })
+    print()
+
+out_path = "difficulty_profile.csv"
+with open(out_path, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+
+print("=" * 70)
+print(f"Difficulty profile written to {out_path}")
+print("=" * 70)
+# Sorted by margin, easiest to hardest -- a quick visual sanity check
+for r in sorted(rows, key=lambda r: -r["curvature_margin_px"]):
+    print(f"  {r['track']:>12}: margin={r['curvature_margin_px']:>+7.1f}px  length={r['total_length_px']:>8.1f}px")
