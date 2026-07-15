@@ -19,6 +19,8 @@ from rectangle import build_rectangle_track
 from spur import build_spur_track
 from bramble import build_bramble_track
 from sawtooth import build_sawtooth_track
+from track8_needle import build_needle_track
+from track9_serpentine import build_serpentine_track
 from verify import verify_track
 
 TRACKS = [
@@ -29,6 +31,8 @@ TRACKS = [
     ("spur", build_spur_track, None),
     ("bramble", build_bramble_track, None),
     ("sawtooth", build_sawtooth_track, None),
+    ("needle", build_needle_track, None),
+    ("serpentine", build_serpentine_track, None),
 ]
 
 rows = []

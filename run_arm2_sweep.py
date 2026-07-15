@@ -20,7 +20,8 @@ import subprocess
 import sys
 import time
 
-ALL_TRACKS = ["basra_loop", "circle", "oval", "rectangle", "spur", "bramble", "sawtooth"]
+ALL_TRACKS = ["basra_loop", "circle", "oval", "rectangle", "spur", "bramble", "sawtooth",
+              "needle", "serpentine"]
 SEEDS = [0, 1, 2]
 
 TOTAL_TIMESTEPS = 503_808

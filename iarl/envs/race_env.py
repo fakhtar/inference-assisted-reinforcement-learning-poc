@@ -410,6 +410,70 @@ def _build_track_sawtooth():
  
     return points, widths
 
+def _build_track_needle():
+    """
+    Track 8: Needle. Isolates the "single tight margin" mechanism --
+    ONE deliberately very tight feature (margin +6.8px, tighter than
+    any other track -- previous minimum was Rectangle's +12.8px), with
+    everything else easy (wide base circle). Companion to Serpentine
+    (track 9), which isolates the OPPOSITE mechanism: many repeated
+    moderate-margin features, no single one tight. Comparing these two
+    lets the sweep distinguish "hard because of raw tightness" from
+    "hard because of feature repetition" instead of conflating them.
+ 
+    Note: the static 3-point curvature check (margin +6.8px) is
+    noticeably more conservative than the actual dynamic autopilot
+    result (clean-lap margin +18.5px, +11.8px even under +/-3px/step
+    noise) -- this gap exists on other tracks too, just more visible
+    here since the margin is deliberately small.
+    """
+    import math
+ 
+    cx, cy, base_r, bump_amplitude = 400, 300, 260, 130
+    bump_center_deg, bump_width_deg, steps, hw, start_offset = 45, 26, 250, 24, -90
+ 
+    points, widths = [], []
+    for i in range(steps):
+        theta_deg = start_offset + 360 * i / steps
+        theta = math.radians(theta_deg)
+        d = (theta_deg - bump_center_deg + 180) % 360 - 180
+        bump = bump_amplitude * math.exp(-(d / (bump_width_deg / 2)) ** 2)
+        r = base_r + bump
+        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+        widths.append(hw)
+ 
+    return points, widths
+ 
+ 
+def _build_track_serpentine():
+    """
+    Track 9: Serpentine. Isolates the "repeated features" mechanism --
+    7 lobes, each with MODERATE margin (+24.1px, comparable to Bramble/
+    Spur, well above Rectangle/Sawtooth's ~13-16px) -- deliberately
+    NOT razor-thin, so any resulting difficulty/instability is
+    attributable to the sheer number of repeated precision-demanding
+    decision points, not to any single one being especially tight.
+    Companion to Needle (track 8), which isolates the opposite
+    mechanism. Same construction as Bramble (single continuous
+    r(theta) = base_r + amplitude*cos(k*theta)), just k=7 instead of
+    k=4, re-tuned for this track's target margin/length.
+    """
+    import math
+ 
+    cx, cy, base_r, amplitude, k = 400, 300, 246, 26, 7
+    steps, hw, start_offset = 350, 26, -100.5
+ 
+    points, widths = [], []
+    for i in range(steps):
+        theta_deg = start_offset + 360 * i / steps
+        theta = math.radians(theta_deg)
+        r = base_r + amplitude * math.cos(k * theta)
+        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+        widths.append(hw)
+ 
+    return points, widths
+ 
+
 TRACK_REGISTRY = {
     "basra_loop": _build_track_basra_loop,
     "circle": _build_track_circle,
@@ -418,7 +482,10 @@ TRACK_REGISTRY = {
     "spur": _build_track_spur,
     "bramble": _build_track_bramble,
     "sawtooth": _build_track_sawtooth,
+    "needle": _build_track_needle,
+    "serpentine": _build_track_serpentine,
 }
+
 def _compute_track_geometry(raw_points, raw_widths):
     """
     Deduplicate, compute per-point normals, build left/right boundaries.

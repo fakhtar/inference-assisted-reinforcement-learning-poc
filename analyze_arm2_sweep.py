@@ -61,7 +61,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--difficulty-csv", type=str, default="difficulty_profile.csv")
     parser.add_argument("--tracks", nargs="+",
-                         default=["basra_loop", "circle", "oval", "rectangle", "spur", "bramble", "sawtooth"])
+                         default=["basra_loop", "circle", "oval", "rectangle", "spur", "bramble",
+                                  "sawtooth", "needle", "serpentine"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     args = parser.parse_args()
 
