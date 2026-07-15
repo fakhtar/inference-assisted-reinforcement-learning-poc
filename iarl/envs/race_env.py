@@ -473,6 +473,81 @@ def _build_track_serpentine():
  
     return points, widths
  
+def _build_track_narrow():
+    """
+    Track 10: Narrow. Isolates corridor-WIDTH difficulty specifically --
+    the axis Needle was originally meant to test but didn't (Needle
+    kept a wide, constant corridor and only varied centerline
+    curvature; see conversation notes for that discovery).
+ 
+    Centerline is a PURE CIRCLE (identical r=278 to the Circle track,
+    zero curvature variation) -- turning difficulty is as close to zero
+    as this track set gets, isolating width as the only variable.
+    half_width narrows via a smooth Gaussian dip from 32px down to
+    10px in one region (a genuine narrow passage, not a sharp turn),
+    then widens back.
+ 
+    Note: Stage 2 (curvature margin) trivially reports +255.8px --
+    IDENTICAL to Circle -- since it only checks centerline bending, not
+    width. That's expected, not a bug; min_half_width (10.0px, tightest
+    in the whole set) is the metric that actually reflects this track's
+    difficulty. The autopilot (Stage 3/4) passes cleanly, but that only
+    confirms physical drivability -- it doesn't predict whether an RL
+    policy will easily discover the tight-centering requirement from
+    unstructured exploration, which is the actual open question this
+    track exists to test.
+    """
+    import math
+ 
+    cx, cy, r, base_hw, min_hw = 400, 300, 278, 32, 10
+    narrow_center_deg, narrow_width_deg, steps, start_offset = 45, 40, 200, -90
+ 
+    points, widths = [], []
+    for i in range(steps):
+        theta_deg = start_offset + 360 * i / steps
+        theta = math.radians(theta_deg)
+        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+        d = (theta_deg - narrow_center_deg + 180) % 360 - 180
+        dip = (base_hw - min_hw) * math.exp(-(d / (narrow_width_deg / 2)) ** 2)
+        widths.append(base_hw - dip)
+ 
+    return points, widths
+
+def _build_track_slalom():
+    """
+    Track 11: Slalom. The hardest track in the set, by design -- built
+    specifically to maximize TOTAL ACCUMULATED TURNING (1405.5 deg over
+    one lap, ~31% beyond Serpentine's previous max of 1074.7 deg,
+    nearly 4x a full circle's 360 deg). This is the single strongest
+    known predictor of training difficulty in this project (r=0.820
+    against mean steps-to-reliable-completion). Margin (+12.9px) kept
+    comparably tight to Sawtooth's (+15.8px) rather than loosened --
+    the goal here is combining both known-relevant factors, unlike
+    Serpentine which deliberately isolated repetition from tightness.
+    Corridor width held constant (26px, matching Sawtooth/Serpentine/
+    Bramble) and NOT varied, since the Narrow track showed width adds
+    essentially zero difficulty in this observation/reward design.
+ 
+    9-lobe periodic curve (r(theta) = base_r + amplitude*cos(9*theta)),
+    same proven construction as Bramble (k=4)/Serpentine (k=7), pushed
+    further. Name is the literal motorsport/skiing term for a course
+    of rapid alternating turns -- describes the actual mechanism this
+    track tests, not just "hard" in the abstract.
+    """
+    import math
+ 
+    cx, cy, base_r, amplitude, k = 400, 300, 255, 22, 9
+    steps, hw, start_offset = 600, 26, -115.5
+ 
+    points, widths = [], []
+    for i in range(steps):
+        theta_deg = start_offset + 360 * i / steps
+        theta = math.radians(theta_deg)
+        r = base_r + amplitude * math.cos(k * theta)
+        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+        widths.append(hw)
+ 
+    return points, widths
 
 TRACK_REGISTRY = {
     "basra_loop": _build_track_basra_loop,
@@ -484,6 +559,8 @@ TRACK_REGISTRY = {
     "sawtooth": _build_track_sawtooth,
     "needle": _build_track_needle,
     "serpentine": _build_track_serpentine,
+    "narrow": _build_track_narrow,
+    "slalom": _build_track_slalom,
 }
 
 def _compute_track_geometry(raw_points, raw_widths):

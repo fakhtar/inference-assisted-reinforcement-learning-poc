@@ -21,7 +21,7 @@ import sys
 import time
 
 ALL_TRACKS = ["basra_loop", "circle", "oval", "rectangle", "spur", "bramble", "sawtooth",
-              "needle", "serpentine"]
+              "needle", "serpentine", "narrow", "slalom"]
 SEEDS = [0, 1, 2]
 
 TOTAL_TIMESTEPS = 503_808

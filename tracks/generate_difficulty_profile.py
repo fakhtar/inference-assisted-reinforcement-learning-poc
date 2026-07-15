@@ -21,6 +21,8 @@ from bramble import build_bramble_track
 from sawtooth import build_sawtooth_track
 from track8_needle import build_needle_track
 from track9_serpentine import build_serpentine_track
+from narrow import build_narrow_track
+from slalom import build_slalom_track
 from verify import verify_track
 
 TRACKS = [
@@ -33,6 +35,8 @@ TRACKS = [
     ("sawtooth", build_sawtooth_track, None),
     ("needle", build_needle_track, None),
     ("serpentine", build_serpentine_track, None),
+    ("narrow", build_narrow_track, None),
+    ("slalom", build_slalom_track, None),
 ]
 
 rows = []
@@ -44,6 +48,8 @@ for name, builder, skip_idx in TRACKS:
         "total_length_px": round(result["total_length"], 1),
         "curvature_margin_px": round(result["curvature_margin"], 1),
         "tightest_radius_px": round(result["curvature_worst_radius"], 1),
+        "min_half_width_px": round(result["min_half_width"], 1),
+        "total_turn_deg": round(result["total_turn_deg"], 1),
         "autopilot_clean_margin_px": round(result["autopilot_clean_margin"], 1),
         "verified_pass": result["overall_pass"],
     })

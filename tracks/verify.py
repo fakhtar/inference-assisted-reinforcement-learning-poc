@@ -220,10 +220,23 @@ def verify_track(raw_points, raw_widths, track_name, skip_tangent_idx=None,
     """
     pts, hws, tangent_angles, arc, total, N = process_geometry(raw_points, raw_widths)
 
+    # Total accumulated |heading change| around the whole lap -- found to
+    # be the single strongest predictor of training difficulty across the
+    # sweep (r=0.820 against mean steps-to-reliable-completion), better
+    # than curvature margin alone or simple feature counting. Reported
+    # here as a first-class metric, not computed ad-hoc per track.
+    dtheta = np.diff(np.unwrap(tangent_angles))
+    total_turn_deg = float(np.degrees(np.sum(np.abs(dtheta))))
+
     print("=" * 70)
     print(f"VERIFYING: {track_name}")
     print("=" * 70)
     print(f"Points: {N}, total length: {total:.1f}px")
+    print(f"Total accumulated turning: {total_turn_deg:.0f} deg over one lap "
+          f"(strongest known difficulty predictor -- see conversation notes)")
+    print(f"Corridor width: min half_width = {hws.min():.1f}px, max = {hws.max():.1f}px "
+          f"(Stage 2 only checks curvature, NOT width -- a wide-margin curvature result "
+          f"can still coexist with a narrow corridor, as on the Narrow track)")
 
     heading_mismatch = check_initial_heading(pts, tangent_angles)
     print(f"\nStage 0 -- Initial heading match: point[0]'s tangent is "
@@ -268,5 +281,7 @@ def verify_track(raw_points, raw_widths, track_name, skip_tangent_idx=None,
         track_name=track_name, N=N, total_length=total,
         tangent_max_discontinuity=max_d, curvature_worst_radius=worst_r,
         curvature_margin=margin, autopilot_clean_margin=clean['min_margin'],
+        min_half_width=float(hws.min()), max_half_width=float(hws.max()),
+        total_turn_deg=total_turn_deg,
         overall_pass=overall, pts=pts, hws=hws,
     )
